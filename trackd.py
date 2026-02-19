@@ -34,6 +34,7 @@ PINCH_THRESHOLD = 50
 COOLDOWN_FRAMES = 5
 AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+HELMET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "helmet.png")
 WINDOW_NAME = "Trackd"
 
 THUMB_TIP = 4
@@ -260,6 +261,47 @@ class HUD:
         cv2.line(frame, (w - margin, h - margin), (w - margin, h - margin - corner_len), color, thickness)
 
 
+def load_helmet(path):
+    """Load helmet PNG with alpha channel."""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"[WARNING] Could not load helmet image: {path}")
+        return None
+    if img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    return img
+
+
+def overlay_image(background, overlay_img, x, y, w, h):
+    """Overlay a BGRA image onto a BGR frame with alpha blending."""
+    resized = cv2.resize(overlay_img, (w, h), interpolation=cv2.INTER_AREA)
+    b, g, r, a = cv2.split(resized)
+    alpha = a.astype(float) / 255.0
+
+    # Clamp to frame bounds
+    y1 = max(0, y)
+    y2 = min(background.shape[0], y + h)
+    x1 = max(0, x)
+    x2 = min(background.shape[1], x + w)
+
+    # Corresponding region in overlay
+    oy1 = y1 - y
+    oy2 = oy1 + (y2 - y1)
+    ox1 = x1 - x
+    ox2 = ox1 + (x2 - x1)
+
+    if y2 <= y1 or x2 <= x1:
+        return
+
+    roi = background[y1:y2, x1:x2]
+    overlay_crop = resized[oy1:oy2, ox1:ox2]
+    alpha_crop = alpha[oy1:oy2, ox1:ox2]
+
+    for c in range(3):
+        roi[:, :, c] = (alpha_crop * overlay_crop[:, :, c] +
+                        (1.0 - alpha_crop) * roi[:, :, c]).astype(np.uint8)
+
+
 def calculate_distance(lm1, lm2, w, h):
     x1, y1 = int(lm1.x * w), int(lm1.y * h)
     x2, y2 = int(lm2.x * w), int(lm2.y * h)
@@ -302,6 +344,12 @@ def main():
     landmarker = HandLandmarker.create_from_options(options)
 
     audio = AudioEngine()
+
+    # Load helmet overlay and face detector
+    helmet_img = load_helmet(HELMET_PATH)
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -346,6 +394,20 @@ def main():
         landmarker.detect_async(mp_image, frame_timestamp_ms)
 
         frame = cv2.addWeighted(frame, 0.7, np.zeros_like(frame), 0.3, 0)
+
+        # Face detection + helmet overlay
+        if helmet_img is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+            )
+            for (fx, fy, fw, fh) in faces:
+                # Scale helmet to cover head (wider and taller than face box)
+                hw = int(fw * 1.4)
+                hh = int(fh * 1.6)
+                hx = fx - int(fw * 0.2)
+                hy = fy - int(fh * 0.45)
+                overlay_image(frame, helmet_img, hx, hy, hw, hh)
 
         result = latest_result[0]
 
