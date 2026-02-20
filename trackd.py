@@ -22,6 +22,9 @@ from mediapipe.tasks.python.vision import (
     HandLandmarker,
     HandLandmarkerOptions,
     HandLandmarkerResult,
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    FaceLandmarkerResult,
     RunningMode,
 )
 import pygame
@@ -34,6 +37,7 @@ PINCH_THRESHOLD = 50
 COOLDOWN_FRAMES = 5
 AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+FACE_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
 HELMET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "helmet.png")
 WINDOW_NAME = "Trackd"
 
@@ -272,9 +276,30 @@ def load_helmet(path):
     return img
 
 
-def overlay_image(background, overlay_img, x, y, w, h):
-    """Overlay a BGRA image onto a BGR frame with alpha blending."""
+def overlay_image_rotated(background, overlay_img, center_x, center_y, w, h, angle_deg=0):
+    """Overlay a BGRA image onto a BGR frame with alpha blending and rotation."""
     resized = cv2.resize(overlay_img, (w, h), interpolation=cv2.INTER_AREA)
+
+    # Rotate the overlay around its center
+    if abs(angle_deg) > 0.5:
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle_deg, 1.0)
+        # Compute new bounding box
+        cos_a = abs(M[0, 0])
+        sin_a = abs(M[0, 1])
+        new_w = int(h * sin_a + w * cos_a)
+        new_h = int(h * cos_a + w * sin_a)
+        M[0, 2] += (new_w - w) / 2
+        M[1, 2] += (new_h - h) / 2
+        resized = cv2.warpAffine(resized, M, (new_w, new_h),
+                                 flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT,
+                                 borderValue=(0, 0, 0, 0))
+        w, h = new_w, new_h
+
+    # Top-left position from center
+    x = center_x - w // 2
+    y = center_y - h // 2
+
     b, g, r, a = cv2.split(resized)
     alpha = a.astype(float) / 255.0
 
@@ -284,7 +309,6 @@ def overlay_image(background, overlay_img, x, y, w, h):
     x1 = max(0, x)
     x2 = min(background.shape[1], x + w)
 
-    # Corresponding region in overlay
     oy1 = y1 - y
     oy2 = oy1 + (y2 - y1)
     ox1 = x1 - x
@@ -345,11 +369,30 @@ def main():
 
     audio = AudioEngine()
 
-    # Load helmet overlay and face detector
+    # Load helmet overlay
     helmet_img = load_helmet(HELMET_PATH)
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
+
+    # Initialize Face Landmarker
+    face_result = [None]
+
+    def on_face_result(result, output_image, timestamp_ms):
+        face_result[0] = result
+
+    face_landmarker = None
+    if os.path.exists(FACE_MODEL_PATH):
+        face_options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=FACE_MODEL_PATH),
+            running_mode=RunningMode.LIVE_STREAM,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            result_callback=on_face_result,
+        )
+        face_landmarker = FaceLandmarker.create_from_options(face_options)
+    else:
+        print(f"[WARNING] Face model not found: {FACE_MODEL_PATH}")
+        print("  Helmet overlay will be disabled.")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -392,22 +435,49 @@ def main():
 
         frame_timestamp_ms += 33
         landmarker.detect_async(mp_image, frame_timestamp_ms)
+        if face_landmarker is not None:
+            face_landmarker.detect_async(mp_image, frame_timestamp_ms)
 
         frame = cv2.addWeighted(frame, 0.7, np.zeros_like(frame), 0.3, 0)
 
-        # Face detection + helmet overlay
-        if helmet_img is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
-            )
-            for (fx, fy, fw, fh) in faces:
-                # Scale helmet to fully cover head (much wider and taller than face box)
-                hw = int(fw * 2.0)
-                hh = int(fh * 2.2)
-                hx = fx - int(fw * 0.5)
-                hy = fy - int(fh * 0.7)
-                overlay_image(frame, helmet_img, hx, hy, hw, hh)
+        # Face landmark-based helmet overlay
+        fr = face_result[0]
+        if helmet_img is not None and fr and fr.face_landmarks:
+            for face_lm in fr.face_landmarks:
+                # Key landmarks (MediaPipe Face Mesh indices):
+                # 10 = top of forehead, 152 = chin bottom
+                # 234 = right temple, 454 = left temple
+                # 1 = nose tip, 168 = between eyes
+                forehead = face_lm[10]
+                chin = face_lm[152]
+                left_temple = face_lm[454]
+                right_temple = face_lm[234]
+                between_eyes = face_lm[168]
+
+                # Calculate face dimensions in pixels
+                face_height = math.sqrt(
+                    ((chin.x - forehead.x) * frame_w) ** 2 +
+                    ((chin.y - forehead.y) * frame_h) ** 2
+                )
+                face_width = math.sqrt(
+                    ((left_temple.x - right_temple.x) * frame_w) ** 2 +
+                    ((left_temple.y - right_temple.y) * frame_h) ** 2
+                )
+
+                # Center of face (true midpoint of forehead to chin)
+                cx = int(((forehead.x + chin.x) / 2) * frame_w)
+                cy = int(((forehead.y + chin.y) / 2) * frame_h)
+
+                # Helmet size — scale generously to cover full head
+                hw = int(face_width * 2.2)
+                hh = int(face_height * 1.9)
+
+                # Head tilt angle from temple positions
+                dx = (left_temple.x - right_temple.x) * frame_w
+                dy = (left_temple.y - right_temple.y) * frame_h
+                angle = -math.degrees(math.atan2(dy, dx))
+
+                overlay_image_rotated(frame, helmet_img, cx, cy, hw, hh, angle)
 
         result = latest_result[0]
 
@@ -469,6 +539,8 @@ def main():
     cv2.destroyAllWindows()
     audio.cleanup()
     landmarker.close()
+    if face_landmarker is not None:
+        face_landmarker.close()
     print("\n  Trackd closed.\n")
 
 
