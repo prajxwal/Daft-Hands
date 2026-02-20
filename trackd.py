@@ -402,11 +402,11 @@ def main():
                 gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
             )
             for (fx, fy, fw, fh) in faces:
-                # Scale helmet to cover head (wider and taller than face box)
-                hw = int(fw * 1.4)
-                hh = int(fh * 1.6)
-                hx = fx - int(fw * 0.2)
-                hy = fy - int(fh * 0.45)
+                # Scale helmet to fully cover head (much wider and taller than face box)
+                hw = int(fw * 2.0)
+                hh = int(fh * 2.2)
+                hx = fx - int(fw * 0.5)
+                hy = fy - int(fh * 0.7)
                 overlay_image(frame, helmet_img, hx, hy, hw, hh)
 
         result = latest_result[0]
